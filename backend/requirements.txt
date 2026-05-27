@@ -1,0 +1,11 @@
+fastapi==0.110.0
+uvicorn==0.28.0
+python-multipart==0.0.9
+torch==2.2.1
+torchvision==0.17.1
+Pillow==10.2.0
+pydantic==2.6.3
+numpy==1.26.4
+sqlalchemy==2.0.28
+passlib[bcrypt]==1.7.4
+python-jose[cryptography]==3.3.0
