@@ -10,4 +10,7 @@ sqlalchemy==2.0.28
 passlib[bcrypt]==1.7.4
 python-jose[cryptography]==3.3.0
 timm==0.9.16
+celery==5.3.6
+redis==5.0.3
+
 

@@ -98,6 +98,3 @@ def predict_image(image_bytes):
         # Return top 3 predictions for a richer UI experience
         "all_probabilities": {CLASSES[i]: float(probabilities[i].item()) for i in range(len(CLASSES))} if len(probabilities) == len(CLASSES) else {}
     }
-
-# Attempt to load the model on startup
-load_model()
