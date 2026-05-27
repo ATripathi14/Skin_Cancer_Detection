@@ -7,6 +7,12 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy.orm import Session
 from celery.result import AsyncResult
 from pydantic import BaseModel
+from jose import jwt, JWTError
+
+# Import SlowAPI rate limiting modules
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 # Import local database and auth modules
 from database import get_db, engine
@@ -15,7 +21,9 @@ from auth import (
     get_password_hash,
     verify_password,
     create_access_token,
-    get_current_user
+    get_current_user,
+    SECRET_KEY,
+    ALGORITHM
 )
 from celery_app import celery_app
 from tasks import predict_image_task
@@ -23,11 +31,41 @@ from tasks import predict_image_task
 # Initialize database tables on application load
 db_models.Base.metadata.create_all(bind=engine)
 
+def get_auth_user_or_ip(request: Request) -> str:
+    """
+    Custom key function for rate limiting:
+    - If request has a valid JWT token, rate limits by 'user:<username>'.
+    - Otherwise, falls back to IP address (get_remote_address).
+    """
+    auth_header = request.headers.get("Authorization")
+    if auth_header and auth_header.startswith("Bearer "):
+        token = auth_header.split(" ")[1]
+        try:
+            payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+            username: str = payload.get("sub")
+            if username:
+                return f"user:{username}"
+        except JWTError:
+            pass
+    return get_remote_address(request)
+
+# Configure the SlowAPI limiter backed by Redis (DB 1 to isolate rate limit keys)
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/1")
+limiter = Limiter(
+    key_func=get_auth_user_or_ip,
+    storage_uri=REDIS_URL,
+    default_limits=["60/minute"] # Strict global rate limit (60 req/min per IP)
+)
+
 app = FastAPI(
     title="Skin Cancer Detection API",
-    description="Asynchronous & Authenticated FastAPI backend for Skin Cancer Detection, leveraging ViT, Celery, and SQLite.",
+    description="Asynchronous, Authenticated, and Rate-Limited FastAPI backend for Skin Cancer Detection, fine-tuned with ViT, Celery, and SQLite.",
     version="1.0.0"
 )
+
+# Bind the limiter and register the clean 429 Too Many Requests exception handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # Configure CORS for the frontend
 app.add_middleware(
@@ -61,13 +99,17 @@ class UserCreate(BaseModel):
     password: str
 
 @app.get("/")
-def read_root():
+def read_root(request: Request):
+    """
+    Root status endpoint. Subject to standard global rate limit (60/min).
+    """
     return {"message": "Welcome to the Skin Cancer Detection API!"}
 
 @app.post("/register", status_code=status.HTTP_201_CREATED)
-def register(user_in: UserCreate, db: Session = Depends(get_db)):
+def register(request: Request, user_in: UserCreate, db: Session = Depends(get_db)):
     """
     Registers a new user account, secure-hashing their password using bcrypt.
+    Subject to global rate limit.
     """
     # Check if username is already taken
     existing_user = db.query(db_models.User).filter(db_models.User.username == user_in.username).first()
@@ -90,10 +132,10 @@ def register(user_in: UserCreate, db: Session = Depends(get_db)):
     return {"username": new_user.username, "message": "User registered successfully"}
 
 @app.post("/login")
-def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
+def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depends(get_db)):
     """
     Authenticates user credentials and returns a secure JWT access token.
-    Compatible with standard OAuth2 password schemes and Swagger interactive testing.
+    Subject to global rate limit.
     """
     # Authenticate credentials
     user = db.query(db_models.User).filter(db_models.User.username == form_data.username).first()
@@ -109,7 +151,9 @@ def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = Depend
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/predict", status_code=status.HTTP_202_ACCEPTED)
+@limiter.limit("5/minute") # Strict limit: 5 requests per minute per authenticated user
 async def predict(
+    request: Request,
     file: UploadFile = File(...),
     current_user: db_models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
@@ -117,7 +161,7 @@ async def predict(
     """
     Protected skin cancer classification endpoint. Saves images locally, maps
     task IDs to the authenticated user ID in SQLite, and dispatches Celery workers.
-    Requires Bearer Token authentication.
+    Strictly rate-limited to 5 requests/minute per authenticated user.
     """
     if not file.content_type.startswith("image/"):
         raise HTTPException(
@@ -165,13 +209,14 @@ async def predict(
 
 @app.get("/api/v1/tasks/{task_id}")
 def get_task_status(
+    request: Request,
     task_id: str,
     current_user: db_models.User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
     """
     Protected polling endpoint that checks task status. Access is restricted to
-    the user who originally requested the task. Requires Bearer Token.
+    the user who originally requested the task. Subject to global rate limit.
     """
     # Fetch task ownership from database
     db_task = db.query(db_models.PredictionTask).filter(
