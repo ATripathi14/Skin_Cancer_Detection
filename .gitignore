@@ -37,6 +37,11 @@ venv.bak/
 .env
 .env.local
 
+# SQLite Database Files
+*.db
+skin_cancer.db
+
+
 # PyTorch Model Files (Large files)
 # We might want to keep the models if they are small, but standard practice is to ignore large weights
 *.pt
